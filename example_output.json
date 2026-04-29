@@ -1,0 +1,52 @@
+{
+  "summary": {
+    "total_subdomains": 3,
+    "potential_takeovers": 1,
+    "targets_scanned": 1
+  },
+  "results": [
+    {
+      "subdomain": "dev.example.com",
+      "source": "ct_log",
+      "dns_active": true,
+      "dns_target": "app-example-dev.azurewebsites.net",
+      "saas": "azure_app_service",
+      "http_status": null,
+      "risk_score": 90,
+      "takeover_possible": true,
+      "confidence": "high",
+      "analysis": [
+        "Azure App Service CNAME detected",
+        "Azure app unreachable (probe failed) - possible orphaned app",
+        "DNS active pointing to SaaS",
+        "Critical subdomain name"
+      ]
+    },
+    {
+      "subdomain": "www.example.com",
+      "source": "ct_log",
+      "dns_active": true,
+      "dns_target": "203.0.113.42",
+      "saas": null,
+      "http_status": 200,
+      "risk_score": 20,
+      "takeover_possible": false,
+      "confidence": "low",
+      "analysis": []
+    },
+    {
+      "subdomain": "portal.example.com",
+      "source": "ct_log",
+      "dns_active": true,
+      "dns_target": "utc-afd01p.azurefd.net",
+      "saas": null,
+      "http_status": 200,
+      "risk_score": 30,
+      "takeover_possible": false,
+      "confidence": "low",
+      "analysis": [
+        "Critical subdomain name"
+      ]
+    }
+  ]
+}

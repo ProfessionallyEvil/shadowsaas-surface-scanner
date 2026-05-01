@@ -40,7 +40,7 @@ A dangling CNAME occurs when a DNS record points to a hostname for a resource th
 **Requirements:** Python 3.8+
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/shadowsaas-surface-scanner.git
+git clone https://github.com/ProfessionallyEvil/shadowsaas-surface-scanner.git
 cd shadowsaas-surface-scanner
 pip install -r requirements.txt
 ```

@@ -1,7 +1,9 @@
 # ShadowSaaS Surface Scanner
 
 **Subdomain Takeover & Dangling CNAME Detector**  
-Author: Jordan Bonagura | Version: 1.0 | Rating: 9.79/10 (pylint)
+Author: Jordan Bonagura | Secure Ideas | Professionally Evil  
+Version: 1.0 | Rating: 9.79/10 (pylint)
+
 
 ---
 

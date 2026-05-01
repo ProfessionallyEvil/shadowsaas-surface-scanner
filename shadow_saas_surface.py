@@ -1,6 +1,8 @@
 """
 ShadowSaaS Surface Scanner v1.0
 Author: Jordan Bonagura
+Secure Ideas - Professionally Evil
+
 
 Enumerates subdomains and detects dangling or abandoned SaaS integrations
 by correlating DNS records, HTTP responses, and provider-specific fingerprints.
@@ -581,14 +583,18 @@ def takeover_reason(saas, dns_target, status, body):
     return reasons
 
 
-def risk_score(subdomain, dns_active, saas, status, body, _source, dns_target=None, _rd=None):
+def risk_score(
+    subdomain, dns_active, saas, status, body, _source,
+    dns_target=None, _rd=None, headers=None
+):
     """
     Calculates risk score, analysis reasons, and takeover_possible flag.
 
-    Each Azure provider block uses specific signals to avoid false positives:
+    Each provider block uses specific signals to avoid false positives:
     - azurewebsites.net: requires provider 404 body signature OR unreachable probe
     - trafficmanager.net: same signals, slightly lower score due to indirection
     - blob.core.windows.net: requires storage-specific 404 signature OR unreachable probe
+    - cloudfront.net: requires body signature AND absence of active CloudFront headers
     - asverify: informational only, raises score, identifies backing Azure service
     - Generic 404 from a live app does NOT trigger takeover
     - HTTP 403 is treated as "app exists, access denied" — not a takeover
@@ -596,6 +602,7 @@ def risk_score(subdomain, dns_active, saas, status, body, _source, dns_target=No
     score = 20
     reasons = []
     takeover_possible = False
+    headers = headers or {}
 
     if _source == "dns_bruteforce":
         reasons.append("Subdomain confirmed via DNS brute-force")
@@ -788,16 +795,29 @@ def risk_score(subdomain, dns_active, saas, status, body, _source, dns_target=No
     # -----------------------------------------------------------------------
     # AWS CloudFront — cloudfront.net
     # CloudFront distribution IDs are unique and never reused by AWS.
-    # Takeover is only possible if the distribution was deleted AND the
-    # body contains AWS's specific error for a missing distribution.
-    # A generic 404 from an active distribution serving missing content
-    # is NOT a takeover indicator.
+    # Takeover is only possible if the distribution was deleted AND the body
+    # contains AWS's specific error for a missing distribution AND the response
+    # lacks active CloudFront headers (x-cache, x-amz-cf-id).
+    #
+    # An active distribution blocking access (WAF, geo-restriction, signed URLs)
+    # returns the same body signatures BUT always injects x-cache and x-amz-cf-id.
+    # Checking for the absence of these headers distinguishes a deleted distribution
+    # from a live one that is simply restricting access — eliminating false positives
+    # on 403 responses from active distributions.
     # -----------------------------------------------------------------------
     if dns_target and "cloudfront.net" in dns_target.lower():
         reasons.append("AWS CloudFront distribution detected")
 
-        cf_deleted = bool(body) and any(
-            sig in body for sig in CLOUDFRONT_DELETED_SIGNATURES
+        # Active distributions always inject these headers, even on error responses.
+        # A deleted distribution has no infrastructure to add them.
+        cf_has_active_headers = bool(
+            headers.get("x-cache") or headers.get("x-amz-cf-id")
+        )
+
+        cf_deleted = (
+            bool(body)
+            and any(sig in body for sig in CLOUDFRONT_DELETED_SIGNATURES)
+            and not cf_has_active_headers
         )
 
         if cf_deleted:
@@ -815,10 +835,16 @@ def risk_score(subdomain, dns_active, saas, status, body, _source, dns_target=No
                 " - check if distribution is disabled or restricted"
             )
         elif status == 403:
-            reasons.append(
-                "CloudFront returned 403"
-                " - distribution active but access restricted (not a takeover)"
-            )
+            if cf_has_active_headers:
+                reasons.append(
+                    "CloudFront returned 403 with active headers"
+                    " - distribution exists, access restricted (not a takeover)"
+                )
+            else:
+                reasons.append(
+                    "CloudFront returned 403 without active headers"
+                    " - distribution may be deleted, manual verification recommended"
+                )
 
     # A-record to non-GitHub infra — not takeover-capable
     if dns_target and dns_target.lower().startswith("a ->"):
@@ -872,7 +898,7 @@ def analyze_subdomain(subdomain, _source, _rd):
     if saas and not is_saas_dns_plausible(saas, dns_target):
         saas = None
 
-    # Calculate risk
+    # Calculate risk — pass headers so CloudFront block can inspect them
     score, reasons, takeover_possible = risk_score(
         subdomain,
         dns_active,
@@ -881,7 +907,8 @@ def analyze_subdomain(subdomain, _source, _rd):
         body,
         _source,
         dns_target=dns_target,
-        _rd=_rd
+        _rd=_rd,
+        headers=headers,
     )
 
     # Confidence
@@ -1018,9 +1045,10 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""
 ┌─────────────────────────────────────────────────────────────────┐
-│          ShadowSaaS Surface Scanner  v1.0                      │
-│                  Jordan Bonagura                               │
-│      Subdomain Takeover & Dangling CNAME Detector               │
+│               ShadowSaaS Surface Scanner  v1.0                  │
+│        Subdomain Takeover & Dangling CNAME Detector             │
+│                      Jordan Bonagura                            │
+│               Secure Ideas - Professionally Evil                │
 └─────────────────────────────────────────────────────────────────┘
 
 Enumerates subdomains and detects dangling or abandoned SaaS
@@ -1077,7 +1105,7 @@ File format (targets.txt):
     input_group.add_argument(
         "domain",
         nargs="?",
-        help="Target domain or subdomain (e.g. example.com or _sub.example.com)"
+        help="Target domain or subdomain (e.g. example.com or sub.example.com)"
     )
     input_group.add_argument(
         "--file", "-f",
@@ -1122,7 +1150,7 @@ File format (targets.txt):
         sys.exit(0)
 
     # ------------------------------------------------------------------
-    # Build _scan_target list
+    # Build target list
     # ------------------------------------------------------------------
     raw_targets = []
 
@@ -1142,7 +1170,7 @@ File format (targets.txt):
             print(f"[!] No valid targets found in {args.file}")
             sys.exit(1)
 
-        print(f"[+] Loaded {len(raw_targets)} _scan_target(s) from {args.file}")
+        print(f"[+] Loaded {len(raw_targets)} target(s) from {args.file}")
     else:
         raw_targets = [args.domain]
 

@@ -1,17 +1,15 @@
 # ShadowSaaS Surface Scanner
 
 **Subdomain Takeover & Dangling CNAME Detector**  
-Author: Jordan Bonagura | Secure Ideas | Professionally Evil  
-Version: 1.0 | Rating: 9.79/10 (pylint)
-
+Author: [Jordan Bonagura](https://www.linkedin.com/in/jordan-bonagura) | [Secure Ideas - Professionally Evil](https://www.secureideas.com) | Version: 1.0
 
 ---
 
 ## Overview
 
-ShadowSaaS Surface Scanner enumerates subdomains and detects dangling or abandoned SaaS integrations by correlating DNS records, HTTP responses, and provider-specific fingerprints. It is designed for use during authorized penetration tests and security assessments to identify subdomain takeover opportunities before attackers do.
+ShadowSaaS Surface Scanner enumerates subdomains and detects dangling or abandoned SaaS integrations by correlating DNS records, HTTP responses, and provider-specific fingerprints. Designed for authorized penetration tests and security assessments to identify subdomain takeover opportunities before attackers do.
 
-A dangling CNAME occurs when a DNS record points to a hostname for a resource that has been deprovisioned or deleted, leaving it available for an attacker to claim — either by registering the domain or by provisioning a new service instance at the same provider. Once claimed, an attacker can host a service that appears to belong to the legitimate organization, enabling phishing, credential harvesting, CSP bypass, and cookie theft.
+A dangling CNAME occurs when a DNS record points to a hostname for a resource that has been deprovisioned or deleted, leaving it available for an attacker to claim. Once claimed, an attacker can host a service that appears to belong to the legitimate organization, enabling phishing, credential harvesting, CSP bypass, and cookie theft.
 
 ---
 
@@ -24,7 +22,7 @@ A dangling CNAME occurs when a DNS record points to a hostname for a resource th
 | Azure Blob Storage | CNAME to `blob.core.windows.net` + storage error signature |
 | Azure Static Apps | CNAME to `azurestaticapps.net` |
 | Azure asverify | Derived CNAME — domain ownership verification records |
-| AWS CloudFront | CNAME to `cloudfront.net` + distribution deleted signature |
+| AWS CloudFront | CNAME to `cloudfront.net` + deleted signature + header check |
 | GitHub Pages | A-record to GitHub IPs or CNAME to `github.io` |
 | Heroku | HTTP body signature (`no such app`) |
 | Vercel | HTTP headers + body signature |
@@ -50,9 +48,9 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-python shadow_saas_surface.py [-h] [--file FILE] [--speculative]
-                               [--bruteforce] [-o FILE] [--pretty]
-                               [--takeovers-only] [domain]
+python shadow_saas_surface.py [-h] [--file FILE] [--speculative] [--bruteforce]
+                               [-o FILE] [--pretty] [--html FILE]
+                               [--quiet] [--takeovers-only] [domain]
 ```
 
 ### Arguments
@@ -65,7 +63,9 @@ python shadow_saas_surface.py [-h] [--file FILE] [--speculative]
 | `--bruteforce` | DNS brute-force against a built-in wordlist |
 | `-o FILE`, `--output FILE` | Write JSON results to a file instead of stdout |
 | `--pretty` | Pretty-print JSON output |
-| `--takeovers-only` | Only output results where `takeover_possible` is true |
+| `--html FILE` | Generate a self-contained HTML report |
+| `--quiet` | Suppress JSON stdout — useful when using `--html` or `-o` |
+| `--takeovers-only` | Only include results where `takeover_possible` is true |
 | `-h`, `--help` | Show help message |
 
 ### Examples
@@ -83,11 +83,20 @@ python shadow_saas_surface.py --file targets.txt
 # Full scan with speculative wordlist and brute-force
 python shadow_saas_surface.py example.com --speculative --bruteforce
 
-# Save only takeover findings as pretty JSON
-python shadow_saas_surface.py example.com --takeovers-only -o findings.json --pretty
+# Save results as JSON
+python shadow_saas_surface.py example.com -o results.json --pretty
 
-# Scan a file of targets and save output
-python shadow_saas_surface.py --file targets.txt -o results.json --pretty
+# Generate HTML report only (no JSON printed to terminal)
+python shadow_saas_surface.py example.com --html report.html --quiet
+
+# JSON + HTML simultaneously, suppress terminal output
+python shadow_saas_surface.py example.com -o results.json --html report.html --quiet
+
+# Only show takeover findings in output
+python shadow_saas_surface.py example.com --takeovers-only --html report.html --quiet
+
+# Scan a file of targets and save both formats
+python shadow_saas_surface.py --file targets.txt -o results.json --html report.html --quiet
 ```
 
 ### File Format (`targets.txt`)
@@ -104,29 +113,29 @@ another.com
 ## Detection Modes
 
 ### CT Log Enumeration (default)
-Queries Certificate Transparency logs to discover subdomains. Uses a cascade of three sources — if one fails or is blocked, the next is tried automatically:
+Queries Certificate Transparency logs to discover subdomains. Uses a cascade of three sources:
 
 1. **crt.sh** — most comprehensive, may block datacenter IPs
 2. **certspotter** — Sectigo CT aggregator, free tier, no key required
 3. **hackertarget** — free tier with daily request limits, no key required
 
 ### Direct Mode
-When given a subdomain with two or more dots (e.g. `staging.example.com`), the tool analyses that specific subdomain directly instead of enumerating.
+When given a subdomain with two or more dots (e.g. `staging.example.com`), analyses that specific subdomain directly instead of enumerating.
 
 ### Speculative Mode (`--speculative`)
-Adds a built-in wordlist of common subdomain names to the scan. Useful when CT logs return no results.
+Adds a built-in wordlist of common subdomain names. Useful when CT logs return no results.
 
 ### Brute-Force Mode (`--bruteforce`)
-Performs DNS brute-force enumeration against a built-in wordlist. Slower but finds subdomains not indexed in CT logs.
+DNS brute-force against a built-in wordlist. Slower but finds subdomains not indexed in CT logs.
 
 ### asverify Derivation (automatic)
-After the first analysis pass, the tool automatically derives `asverify.<subdomain>` candidates for every confirmed Azure subdomain. These records are Azure domain-ownership verification CNAMEs that never appear in CT logs.
+After the first analysis pass, automatically derives `asverify.<subdomain>` candidates for every confirmed Azure subdomain. These records never appear in CT logs.
 
 ---
 
-## Output Format
+## Output
 
-Results are returned as JSON with a summary and a per-subdomain results array.
+### JSON (`-o` / `--pretty`)
 
 ```json
 {
@@ -157,7 +166,14 @@ Results are returned as JSON with a summary and a per-subdomain results array.
 }
 ```
 
-### Fields
+### HTML (`--html`)
+Generates a self-contained branded report with:
+- Risk score bars, confidence badges, and takeover indicators
+- Filter buttons (All / Takeovers only / High confidence / DNS active)
+- Live search across subdomains and targets
+- **Inspect** button per row linking to [web-check.xyz](https://web-check.xyz) for instant OSINT
+
+### Output Fields
 
 | Field | Description |
 |---|---|
@@ -185,15 +201,15 @@ Results are returned as JSON with a summary and a per-subdomain results array.
 
 ## False Positive Guidance
 
-The tool is designed to minimise false positives but manual verification is always recommended before reporting a finding.
+**Azure App Service 403** — HTTP 403 means the app exists and is responding with access denied. Not a takeover.
 
-**Azure App Service 403** — HTTP 403 means the app exists and is responding with access denied. This is not a takeover. The tool reports it as informational.
+**Azure App Service 404** — Generic 404 from a live app is not a takeover. The tool only flags Azure takeovers when the response body contains Azure's specific "app not found" signatures, or when the probe fails entirely.
 
-**Azure App Service 404** — A generic 404 from a live app is not a takeover. The tool only flags Azure takeovers when the response body contains Azure's specific "app not found" page signatures, or when the probe fails entirely (`http_status: null`).
+**AWS CloudFront 403** — Active distributions always inject `x-cache` and `x-amz-cf-id` headers even on 403 responses. The tool checks for the absence of these headers before confirming a takeover, eliminating false positives from WAF/geo-restriction/signed URL blocks.
 
-**AWS CloudFront 404** — CloudFront distribution IDs are unique and never reused by AWS. A 404 from an active distribution serving missing content is not a takeover. Only a confirmed deleted distribution signature triggers the flag.
+**AWS CloudFront 404** — CloudFront distribution IDs are unique and never reused by AWS. A 404 from an active distribution is not a takeover.
 
-**Azure Traffic Manager with non-HTTP protocol** — Traffic Manager endpoints fronting LDAP, SMTP, or VPN services will not respond to HTTP probes. A `null` HTTP status for these is expected and not an orphan signal.
+**Azure Traffic Manager with non-HTTP protocol** — Endpoints fronting LDAP, SMTP, or VPN services will not respond to HTTP probes. A `null` HTTP status is expected and not an orphan signal.
 
 ---
 

@@ -38,7 +38,7 @@ GITHUB_PAGES_IPS = {
     "185.199.108.153",
     "185.199.109.153",
     "185.199.110.153",
-    "185.199.111.153"
+    "185.199.111.153",
 }
 
 # Azure provider 404 page signatures — confirms the app slot is deleted/unprovisioned.
@@ -92,6 +92,15 @@ MANAGED_SAAS_TYPES = (
     "azure_blob_storage",
     "aws_cloudfront",
 )
+
+# Non-HTTP protocol indicators — subdomains/targets containing these labels
+# will never respond to HTTP probes even when fully active (LDAP, VPN, etc.).
+# Used to avoid false positives when http_status is null for non-HTTP services.
+NON_HTTP_INDICATORS = [
+    "ldap", "ldaps", "smtp", "ftp", "sftp",
+    "rdp", "ssh", "sql", "db", "database",
+    "vpn", "radius", "sip", "voip",
+]
 
 # ---------------------------------------------------------------------------
 # Subdomain validation
@@ -549,6 +558,17 @@ def fingerprint_saas(headers, body):
 # Risk scoring
 # ---------------------------------------------------------------------------
 
+def _is_non_http_endpoint(_sub_name, _dns_tgt):
+    """Return True if subdomain/target name suggests a non-HTTP protocol service.
+
+    Endpoints fronting LDAP, VPN, SMTP, etc. will never respond to HTTP probes
+    even when fully active. A null HTTP status for these is expected behaviour
+    and should not be treated as an orphan signal.
+    """
+    label = (_sub_name or "").lower()
+    tgt   = (_dns_tgt or "").lower()
+    return any(ind in label or ind in tgt for ind in NON_HTTP_INDICATORS)
+
 def is_critical_subdomain(subdomain):
     """Returns True if the first label of the subdomain is in CRITICAL_NAMES."""
     label = subdomain.split(".")[0]
@@ -624,9 +644,17 @@ def risk_score(
             score += 40
             reasons.append("Azure provider 404 confirmed - app slot deleted or unprovisioned")
         elif status is None:
-            takeover_possible = True
-            score += 40
-            reasons.append("Azure app unreachable (probe failed) - possible orphaned app")
+            if _is_non_http_endpoint(subdomain, dns_target):
+                reasons.append(
+                    "Azure app unreachable via HTTP"
+                    " - likely non-HTTP protocol endpoint (not a takeover)"
+                )
+            else:
+                takeover_possible = True
+                score += 40
+                reasons.append(
+                    "Azure app unreachable (probe failed) - possible orphaned app"
+                )
         elif status == 403:
             reasons.append("Azure app returned 403 - app exists but access denied (not a takeover)")
         elif status == 404:
@@ -650,12 +678,18 @@ def risk_score(
                 " - possible orphaned endpoint"
             )
         elif status is None:
-            takeover_possible = True
-            score += 35
-            reasons.append(
-                "Traffic Manager backend unreachable (probe failed)"
-                " - possible orphaned endpoint"
-            )
+            if _is_non_http_endpoint(subdomain, dns_target):
+                reasons.append(
+                    "Traffic Manager backend unreachable via HTTP"
+                    " - likely non-HTTP protocol endpoint (not a takeover)"
+                )
+            else:
+                takeover_possible = True
+                score += 35
+                reasons.append(
+                    "Traffic Manager backend unreachable (probe failed)"
+                    " - possible orphaned endpoint"
+                )
         elif status == 403:
             reasons.append(
                 "Traffic Manager returned 403"
@@ -930,6 +964,563 @@ def analyze_subdomain(subdomain, _source, _rd):
     }
 
 
+
+def _render_html_report(_report_data):
+    """Render scan results as a self-contained HTML report string."""
+    summary = _report_data.get("summary", {})
+    results = _report_data.get("results", [])
+
+    total     = summary.get("total_subdomains", 0)
+    takeovers = summary.get("potential_takeovers", 0)
+    scanned   = summary.get("targets_scanned", 0)
+
+    confidence_order = {"high": 0, "medium": 1, "low": 2, "speculative": 3}
+    results_sorted = sorted(
+        results,
+        key=lambda r: (
+            0 if r.get("takeover_possible") else 1,
+            confidence_order.get(r.get("confidence", "low"), 9),
+            -(r.get("risk_score") or 0),
+        ),
+    )
+
+    def badge(confidence):
+        """Return HTML badge for confidence level."""
+        colours = {
+            "high":        ("cf-badge cf-badge-high",        "HIGH"),
+            "medium":      ("cf-badge cf-badge-medium",      "MEDIUM"),
+            "low":         ("cf-badge cf-badge-low",         "LOW"),
+            "speculative": ("cf-badge cf-badge-speculative", "SPECULATIVE"),
+        }
+        cls, label = colours.get(confidence, ("cf-badge cf-badge-low", confidence.upper()))
+        return f'<span class="{cls}">{label}</span>'
+
+    def score_bar(score):
+        """Return a risk-score progress bar."""
+        pct = min(max(score or 0, 0), 100)
+        clr = "#D32027" if pct >= 70 else ("#e07b00" if pct >= 45 else "#00a878")
+        return (
+            f'<div class="score-wrap">'
+            f'<div class="score-bar" style="width:{pct}%;background:{clr}"></div>'
+            f'<span class="score-num">{pct}</span>'
+            f'</div>'
+        )
+
+    def row(r):
+        """Return HTML table row for one result."""
+        sub         = r.get("subdomain", "")
+        takeover    = r.get("takeover_possible", False)
+        dns_target  = r.get("dns_target") or "—"
+        saas        = r.get("saas") or "—"
+        http_status = r.get("http_status")
+        status_str  = str(http_status) if http_status is not None else "—"
+        risk        = r.get("risk_score", 20)
+        conf        = r.get("confidence", "low")
+        analysis    = r.get("analysis") or []
+        row_cls     = "row-takeover" if takeover else ""
+        takeover_cell = (
+            '<span class="pill pill-yes">&#9888; YES</span>' if takeover
+            else '<span class="pill pill-no">NO</span>'
+        )
+        analysis_html = (
+            "".join(f"<li>{a}</li>" for a in analysis) if analysis else "<li>—</li>"
+        )
+        inspect_url = f"https://web-check.xyz/check/{sub}"
+        inspect_btn = (
+            f'<a class="inspect-btn" href="{inspect_url}" target="_blank" '
+            f'rel="noopener noreferrer">&#128269; Inspect</a>'
+        )
+        return f"""
+        <tr class="{row_cls}">
+          <td class="td-sub"><span class="subdomain">{sub}</span></td>
+          <td>{takeover_cell}</td>
+          <td>{score_bar(risk)}</td>
+          <td>{badge(conf)}</td>
+          <td class="td-mono">{dns_target}</td>
+          <td class="td-saas">{saas}</td>
+          <td class="td-status">{status_str}</td>
+          <td><ul class="analysis-list">{analysis_html}</ul></td>
+          <td>{inspect_btn}</td>
+        </tr>"""
+
+    rows_html = "\n".join(row(r) for r in results_sorted)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ShadowSaaS Report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
+<style>
+  :root {{
+    --bg:        #031B26;
+    --surface:   #01161E;
+    --surface2:  #063348;
+    --border:    #0a4a63;
+    --teal:      #004E63;
+    --teal-lt:   #006b87;
+    --red:       #D32027;
+    --red-dk:    #a81820;
+    --text:      #cdd9e0;
+    --text-dim:  #7a9aaa;
+    --muted:     #3d6070;
+    --takeover:  rgba(211,32,39,.08);
+    --radius:    5px;
+  }}
+
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Lato', sans-serif;
+    font-size: 13px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }}
+
+  a {{ color: var(--teal-lt); text-decoration: none; transition: color .15s; }}
+  a:hover {{ color: #fff; }}
+
+  /* ── header ── */
+  .header {{
+    background: linear-gradient(160deg, #020f18 0%, var(--teal) 100%);
+    border-bottom: 3px solid var(--red);
+    padding: 36px 48px 28px;
+    position: relative;
+    overflow: hidden;
+  }}
+  .header::before {{
+    content: "";
+    position: absolute; inset: 0;
+    background:
+      repeating-linear-gradient(0deg,transparent,transparent 39px,rgba(0,78,99,.15) 40px),
+      repeating-linear-gradient(90deg,transparent,transparent 39px,rgba(0,78,99,.15) 40px);
+    pointer-events: none;
+  }}
+  .header::after {{
+    content: "";
+    position: absolute;
+    right: -60px; top: -60px;
+    width: 320px; height: 320px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(211,32,39,.18) 0%, transparent 70%);
+    pointer-events: none;
+  }}
+  .header-inner {{ position: relative; z-index: 1; }}
+  .logo {{
+    font-size: 11px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,.55);
+    margin-bottom: 8px;
+    font-family: 'Share Tech Mono', monospace;
+  }}
+  h1 {{
+    font-family: 'Lato', sans-serif;
+    font-size: 42px;
+    font-weight: 900;
+    color: #fff;
+    letter-spacing: -1px;
+    line-height: 1;
+    text-transform: uppercase;
+  }}
+  h1 .red {{ color: var(--red); }}
+  .subtitle {{
+    font-size: 12px;
+    color: rgba(255,255,255,.45);
+    margin-top: 8px;
+    font-family: 'Share Tech Mono', monospace;
+    letter-spacing: .04em;
+  }}
+  .subtitle a {{
+    color: rgba(255,255,255,.65);
+    border-bottom: 1px solid rgba(255,255,255,.2);
+    padding-bottom: 1px;
+  }}
+  .subtitle a:hover {{ color: #fff; border-color: #fff; }}
+
+  /* ── stat cards ── */
+  .stats {{
+    display: flex;
+    gap: 16px;
+    padding: 28px 48px;
+    flex-wrap: wrap;
+  }}
+  .stat-card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px 28px;
+    min-width: 160px;
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }}
+  .stat-card::before {{
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: var(--border);
+  }}
+  .stat-card.teal::before  {{ background: var(--teal-lt); }}
+  .stat-card.danger::before {{ background: var(--red); }}
+  .stat-card.neutral::before {{ background: var(--muted); }}
+  .stat-label {{
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .18em;
+    color: var(--text-dim);
+    font-weight: 700;
+  }}
+  .stat-value {{
+    font-family: 'Lato', sans-serif;
+    font-size: 54px;
+    font-weight: 900;
+    color: #fff;
+    line-height: 1;
+    margin-top: 6px;
+    letter-spacing: -2px;
+  }}
+  .stat-card.teal   .stat-value {{ color: var(--teal-lt); }}
+  .stat-card.danger .stat-value {{ color: var(--red); }}
+
+  /* ── toolbar ── */
+  .toolbar {{
+    padding: 0 48px 18px;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+  }}
+  .filter-btn {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 6px 16px;
+    border-radius: 20px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: 'Lato', sans-serif;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    transition: all .15s;
+  }}
+  .filter-btn:hover {{
+    border-color: var(--teal-lt);
+    color: #fff;
+  }}
+  .filter-btn.active {{
+    background: var(--teal);
+    border-color: var(--teal-lt);
+    color: #fff;
+  }}
+  .filter-btn.active-danger {{
+    background: var(--red-dk);
+    border-color: var(--red);
+    color: #fff;
+  }}
+  #search {{
+    margin-left: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 7px 14px;
+    border-radius: var(--radius);
+    font-size: 12px;
+    font-family: 'Lato', sans-serif;
+    width: 240px;
+    outline: none;
+    transition: border .15s;
+  }}
+  #search:focus {{ border-color: var(--teal-lt); }}
+  #search::placeholder {{ color: var(--muted); }}
+
+  /* ── table ── */
+  .table-wrap {{
+    padding: 16px 48px 48px;
+    overflow-x: auto;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }}
+  thead tr {{
+    background: var(--surface2);
+    border-bottom: 2px solid var(--teal);
+  }}
+  th {{
+    padding: 11px 12px;
+    text-align: left;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .14em;
+    color: var(--teal-lt);
+    font-weight: 700;
+    white-space: nowrap;
+    font-family: 'Lato', sans-serif;
+  }}
+  td {{
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(10,74,99,.5);
+    vertical-align: top;
+  }}
+  tr:hover td {{ background: rgba(0,78,99,.12); }}
+  .row-takeover td {{ background: var(--takeover); }}
+  .row-takeover:hover td {{ background: rgba(211,32,39,.14); }}
+
+  /* ── cells ── */
+  .subdomain {{
+    font-family: 'Share Tech Mono', monospace;
+    color: #fff;
+    font-size: 12px;
+    word-break: break-all;
+  }}
+  .td-mono {{
+    font-family: 'Share Tech Mono', monospace;
+    color: var(--text-dim);
+    font-size: 11px;
+    word-break: break-all;
+    max-width: 200px;
+  }}
+  .td-saas {{
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: var(--teal-lt);
+  }}
+  .td-status {{
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text);
+  }}
+
+  /* ── pills ── */
+  .pill {{
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    font-family: 'Lato', sans-serif;
+  }}
+  .pill-yes {{ background: rgba(211,32,39,.2); color: #f07070; border: 1px solid rgba(211,32,39,.45); }}
+  .pill-no  {{ background: rgba(0,168,120,.12); color: #00a878; border: 1px solid rgba(0,168,120,.3); }}
+
+  /* ── confidence badges ── */
+  .cf-badge {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    font-family: 'Lato', sans-serif;
+    text-transform: uppercase;
+  }}
+  .cf-badge-high        {{ background: rgba(211,32,39,.22);  color: #f07070; }}
+  .cf-badge-medium      {{ background: rgba(224,123,0,.18);  color: #e07b00; }}
+  .cf-badge-low         {{ background: rgba(61,96,112,.35);  color: #7a9aaa; }}
+  .cf-badge-speculative {{ background: rgba(100,80,200,.2);  color: #9b8de8; }}
+
+  /* ── score bar ── */
+  .score-wrap {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 110px;
+  }}
+  .score-bar {{
+    height: 5px;
+    border-radius: 3px;
+    flex: 1;
+    max-width: 70px;
+  }}
+  .score-num {{
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    min-width: 22px;
+  }}
+
+  /* ── analysis list ── */
+  .analysis-list {{
+    list-style: none;
+    padding: 0;
+    max-width: 340px;
+  }}
+  .analysis-list li {{
+    font-size: 11px;
+    color: var(--text-dim);
+    padding: 1px 0 1px 12px;
+    position: relative;
+    line-height: 1.5;
+  }}
+  .analysis-list li::before {{
+    content: "›";
+    position: absolute;
+    left: 0;
+    color: var(--teal-lt);
+  }}
+
+  /* ── inspect button ── */
+  .inspect-btn {{
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: var(--radius);
+    font-size: 10px;
+    font-family: 'Lato', sans-serif;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--teal-lt);
+    border: 1px solid var(--teal);
+    text-decoration: none;
+    white-space: nowrap;
+    transition: all .15s;
+  }}
+  .inspect-btn:hover {{
+    background: var(--teal);
+    color: #fff;
+    border-color: var(--teal-lt);
+  }}
+
+  tr.hidden {{ display: none; }}
+
+  /* ── footer ── */
+  .footer {{
+    text-align: center;
+    padding: 24px 48px;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: 'Lato', sans-serif;
+    letter-spacing: .04em;
+    border-top: 1px solid var(--border);
+  }}
+  .footer a {{
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--muted);
+    padding-bottom: 1px;
+  }}
+  .footer a:hover {{ color: #fff; border-color: #fff; }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-inner">
+    <div class="logo">&#9632; Secure Ideas · Professionally Evil</div>
+    <h1>Shadow<span class="red">SaaS</span> Surface Scanner</h1>
+    <div class="subtitle">
+      Subdomain Takeover &amp; Dangling CNAME Report &nbsp;·&nbsp; v1.0
+      &nbsp;·&nbsp;
+      <a href="https://www.linkedin.com/in/jordan-bonagura" target="_blank" rel="noopener noreferrer">Jordan Bonagura</a>
+      &nbsp;·&nbsp;
+      <a href="https://www.secureideas.com" target="_blank" rel="noopener noreferrer">Secure Ideas - Professionally Evil</a>
+    </div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat-card teal">
+    <div class="stat-label">Targets Scanned</div>
+    <div class="stat-value">{scanned}</div>
+  </div>
+  <div class="stat-card neutral">
+    <div class="stat-label">Subdomains Analysed</div>
+    <div class="stat-value">{total}</div>
+  </div>
+  <div class="stat-card danger">
+    <div class="stat-label">Potential Takeovers</div>
+    <div class="stat-value">{takeovers}</div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <button class="filter-btn active" onclick="filterRows('all',this)">All</button>
+  <button class="filter-btn" onclick="filterRows('takeover',this)">&#9888; Takeovers only</button>
+  <button class="filter-btn" onclick="filterRows('high',this)">High confidence</button>
+  <button class="filter-btn" onclick="filterRows('active',this)">DNS active</button>
+  <input id="search" type="text" placeholder="Search subdomain / target…" oninput="searchRows(this.value)"/>
+</div>
+
+<div class="table-wrap">
+  <table id="results-table">
+    <thead>
+      <tr>
+        <th>Subdomain</th>
+        <th>Takeover</th>
+        <th>Risk Score</th>
+        <th>Confidence</th>
+        <th>DNS Target</th>
+        <th>SaaS</th>
+        <th>HTTP</th>
+        <th>Analysis</th>
+        <th>Inspect</th>
+      </tr>
+    </thead>
+    <tbody id="results-body">
+{rows_html}
+    </tbody>
+  </table>
+</div>
+
+<div class="footer">
+  Generated by ShadowSaaS Surface Scanner v1.0 &nbsp;&middot;&nbsp;
+  <a href="https://www.linkedin.com/in/jordan-bonagura" target="_blank" rel="noopener noreferrer">Jordan Bonagura</a>
+  &nbsp;&middot;&nbsp;
+  <a href="https://www.secureideas.com" target="_blank" rel="noopener noreferrer">Secure Ideas - Professionally Evil</a>
+</div>
+
+<script>
+  const rows = Array.from(document.querySelectorAll('#results-body tr'));
+  let currentFilter = 'all';
+  let currentSearch = '';
+
+  function applyFilters() {{
+    rows.forEach(r => {{
+      const takeover = r.classList.contains('row-takeover');
+      const conf     = r.querySelector('.cf-badge');
+      const confText = conf ? conf.textContent.trim().toLowerCase() : '';
+      const dnsCell  = r.querySelector('.td-mono');
+      const dnsActive = dnsCell ? dnsCell.textContent.trim() !== '—' : false;
+      const text     = r.textContent.toLowerCase();
+
+      let show = true;
+      if (currentFilter === 'takeover' && !takeover)           show = false;
+      if (currentFilter === 'high'     && confText !== 'high') show = false;
+      if (currentFilter === 'active'   && !dnsActive)          show = false;
+      if (currentSearch  && !text.includes(currentSearch))     show = false;
+
+      r.classList.toggle('hidden', !show);
+    }});
+  }}
+
+  function filterRows(type, btn) {{
+    currentFilter = type;
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active','active-danger'));
+    btn.classList.add(type === 'takeover' ? 'active-danger' : 'active');
+    applyFilters();
+  }}
+
+  function searchRows(val) {{
+    currentSearch = val.toLowerCase();
+    applyFilters();
+  }}
+</script>
+</body>
+</html>"""
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1072,6 +1663,13 @@ Detection modes:
   Speculative  — Wordlist-based guessing for common subdomains
   Brute-force  — DNS brute-force against a built-in wordlist
 
+Output options:
+  -o / --output    — Save results as JSON file
+  --pretty         — Pretty-print JSON output
+  --html FILE      — Generate a self-contained HTML report
+  --quiet          — Suppress JSON stdout (use with --html or -o)
+  --takeovers-only — Only include takeover findings in output
+
 Intended for authorized security testing only.
         """,
         epilog="""
@@ -1088,19 +1686,27 @@ Examples:
   # Full scan with speculative wordlist and brute-force
   python shadow_saas_surface.py example.com --speculative --bruteforce
 
-  # Save results as pretty-printed JSON
+  # Save results as JSON
   python shadow_saas_surface.py example.com -o results.json --pretty
 
-  # Scan a file of targets and save output
-  python shadow_saas_surface.py --file targets.txt -o results.json --pretty
+  # Generate HTML report only (no JSON printed to terminal)
+  python shadow_saas_surface.py example.com --html report.html --quiet
+
+  # JSON + HTML simultaneously, suppress terminal output
+  python shadow_saas_surface.py example.com -o results.json --html report.html --quiet
+
+  # Only show takeover findings in output
+  python shadow_saas_surface.py example.com --takeovers-only --html report.html --quiet
+
+  # Scan a file of targets and save both formats
+  python shadow_saas_surface.py --file targets.txt -o results.json --html report.html --quiet
 
 File format (targets.txt):
   example.com
   staging.example.com
   # Lines starting with # are treated as comments and skipped
   another.com
-        """
-    )
+        """    )
 
     # Mutually exclusive: either a positional domain OR --file
     input_group = parser.add_mutually_exclusive_group(required=False)
@@ -1138,6 +1744,19 @@ File format (targets.txt):
         "--pretty",
         action="store_true",
         help="Pretty-print JSON output (indent=2). Has no effect without -o or stdout."
+    )
+    parser.add_argument(
+        "--html",
+        metavar="FILE",
+        help="Write a self-contained HTML report to FILE (e.g. report.html)."
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress JSON stdout output. "
+            "Useful when using --html or --output to avoid printing to terminal."
+        )
     )
     parser.add_argument(
         "--takeovers-only",
@@ -1244,5 +1863,11 @@ File format (targets.txt):
         print(f"Potential takeovers found: {total_takeovers}")
         print("=================================\n")
         print(f"[+] Results saved to {args.output}")
-    else:
+    elif not args.quiet:
         print(json_output)
+
+    if args.html:
+        html = _render_html_report(output_data)
+        with open(args.html, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        print(f"[+] HTML report saved to {args.html}")

@@ -5,6 +5,14 @@ Author: [Jordan Bonagura](https://www.linkedin.com/in/jordan-bonagura) | [Secure
 
 ---
 
+## HTML Report Preview
+
+![ShadowSaaS HTML Report Preview](docs/report_preview.svg)
+
+> Generated with `--html report.html --quiet`. Each row links to [web-check.xyz](https://web-check.xyz) for instant OSINT on the target subdomain.
+
+---
+
 ## Overview
 
 ShadowSaaS Surface Scanner enumerates subdomains and detects dangling or abandoned SaaS integrations by correlating DNS records, HTTP responses, and provider-specific fingerprints. Designed for authorized penetration tests and security assessments to identify subdomain takeover opportunities before attackers do.
@@ -18,11 +26,11 @@ A dangling CNAME occurs when a DNS record points to a hostname for a resource th
 | Provider | Detection Method |
 |---|---|
 | Azure App Service | CNAME to `azurewebsites.net` + provider 404 body signature |
-| Azure Traffic Manager | CNAME to `trafficmanager.net` + unreachable probe |
+| Azure Traffic Manager | CNAME to `trafficmanager.net` + unreachable probe + non-HTTP detection |
 | Azure Blob Storage | CNAME to `blob.core.windows.net` + storage error signature |
 | Azure Static Apps | CNAME to `azurestaticapps.net` |
 | Azure asverify | Derived CNAME — domain ownership verification records |
-| AWS CloudFront | CNAME to `cloudfront.net` + deleted signature + header check |
+| AWS CloudFront | CNAME to `cloudfront.net` + deleted signature + active header check |
 | GitHub Pages | A-record to GitHub IPs or CNAME to `github.io` |
 | Heroku | HTTP body signature (`no such app`) |
 | Vercel | HTTP headers + body signature |
@@ -113,7 +121,7 @@ another.com
 ## Detection Modes
 
 ### CT Log Enumeration (default)
-Queries Certificate Transparency logs to discover subdomains. Uses a cascade of three sources:
+Queries Certificate Transparency logs to discover subdomains. Uses a cascade of three sources — if one fails or is blocked, the next is tried automatically:
 
 1. **crt.sh** — most comprehensive, may block datacenter IPs
 2. **certspotter** — Sectigo CT aggregator, free tier, no key required
@@ -171,7 +179,7 @@ Generates a self-contained branded report with:
 - Risk score bars, confidence badges, and takeover indicators
 - Filter buttons (All / Takeovers only / High confidence / DNS active)
 - Live search across subdomains and targets
-- **Inspect** button per row linking to [web-check.xyz](https://web-check.xyz) for instant OSINT
+- **Inspect** button per row linking to [web-check.xyz](https://web-check.xyz) for instant OSINT (DNS, headers, certificate, screenshot, ports)
 
 ### Output Fields
 
@@ -209,7 +217,7 @@ Generates a self-contained branded report with:
 
 **AWS CloudFront 404** — CloudFront distribution IDs are unique and never reused by AWS. A 404 from an active distribution is not a takeover.
 
-**Azure Traffic Manager with non-HTTP protocol** — Endpoints fronting LDAP, SMTP, or VPN services will not respond to HTTP probes. A `null` HTTP status is expected and not an orphan signal.
+**Azure Traffic Manager with non-HTTP protocol** — Endpoints fronting LDAP, SMTP, VPN, or other non-HTTP services will not respond to HTTP probes. The tool checks for non-HTTP indicators in the subdomain name and DNS target before flagging these as orphaned.
 
 ---
 

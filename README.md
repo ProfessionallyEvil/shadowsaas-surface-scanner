@@ -23,23 +23,23 @@ A dangling CNAME occurs when a DNS record points to a hostname for a resource th
 
 ## Providers Covered
 
-| Provider | Detection Method |
-|---|---|
-| Azure App Service | CNAME to `azurewebsites.net` + provider 404 body signature |
-| Azure Traffic Manager | CNAME to `trafficmanager.net` + unreachable probe + non-HTTP detection |
-| Azure Blob Storage | CNAME to `blob.core.windows.net` + storage error signature |
-| Azure Static Apps | CNAME to `azurestaticapps.net` |
-| Azure asverify | Derived CNAME — domain ownership verification records |
-| AWS CloudFront | CNAME to `cloudfront.net` + deleted signature + active header check |
-| GitHub Pages | A-record to GitHub IPs or CNAME to `github.io` |
-| Heroku | HTTP body signature (`no such app`) |
-| Vercel | HTTP headers + body signature |
-| Netlify | HTTP headers + body signature |
-| Shopify | HTTP headers |
-| Firebase | HTTP headers + body signature (strict) |
-| Cloudflare Pages | HTTP body signature (not claimable — informational) |
+| Provider              | Detection Method |
+|------------------------|-------------------|
+| Azure App Service      | CNAME to azurewebsites.net + provider 404 body signature |
+| Azure Traffic Manager  | CNAME to trafficmanager.net + unreachable probe + non-HTTP detection |
+| Azure Blob Storage     | CNAME to blob.core.windows.net + storage error signature |
+| Azure Static Apps      | CNAME to azurestaticapps.net |
+| Azure asverify         | Derived CNAME — domain ownership verification records |
+| AWS CloudFront         | CNAME to cloudfront.net + deleted signature + active header check |
+| GitHub Pages           | A-record to GitHub IPs or CNAME to github.io |
+| Heroku                 | HTTP body signature (no such app) OR empty-body 404 from Heroku's router with no backend app match, cross-checked against CNAME to herokudns.com/herokuapp.com |
+| Vercel                 | HTTP headers + body signature, cross-checked against CNAME to vercel-dns.com/vercel.app |
+| Netlify                | HTTP headers + body signature, cross-checked against CNAME to netlify.app/netlify.com |
+| Shopify                | HTTP headers, cross-checked against CNAME to myshopify.com |
+| Firebase               | HTTP headers + body signature (strict) + CNAME to googlehosted.com required |
+| Cloudflare Pages       | HTTP body signature, cross-checked against CNAME to pages.dev (not claimable — informational) |
 
----
+> **Note (v1.1):** Providers detected only via HTTP fingerprinting (Heroku, Vercel, Netlify, Shopify, Cloudflare Pages) are now cross-validated against their expected CNAME domain pattern before being flagged. This prevents false positives when a backend behind an unrelated CDN (e.g. Fastly) returns a body or header that coincidentally matches a provider's fingerprint. Heroku detection was further refined to distinguish a live app's own 404 (not a takeover) from an empty-body 404 returned directly by Heroku's router when no app is bound to the hostname (confirmed dangling).
 
 ## Installation
 

@@ -26,7 +26,7 @@ BRUTEFORCE_NAMES = [
     "dashboard", "service", "services"
 ]
 
-# Critical subdomains
+# Critical subdomains - Speculative
 CRITICAL_NAMES = [
     "login", "auth", "api", "app", "portal",
     "dev", "staging", "old", "test", "preview",
@@ -81,6 +81,14 @@ CLOUDFRONT_DELETED_SIGNATURES = [
     "error: the request could not be satisfied",
     "no such distribution",
     "distribution is disabled",
+]
+# Heroku "domain not claimed by any app" signatures.
+# A generic 404 from a live app (wrong route, crashed app, custom error
+# page) does NOT contain these strings and must not be treated as a
+# takeover — see _heroku_router_rejected() for the companion check.
+HEROKU_NO_SUCH_APP_SIGNATURES = [
+    "no such app",
+    "herokucdn.com/error-pages/no-such-app.html",
 ]
 
 # SaaS types with dedicated risk blocks — excluded from the generic SaaS block.
@@ -393,6 +401,21 @@ def http_probe(subdomain):
 # SaaS detection
 # ---------------------------------------------------------------------------
 
+# CNAME domain patterns required to confirm each HTTP-fingerprinted SaaS type.
+# fingerprint_saas() only looks at headers/body, so any provider detected
+# there MUST be cross-checked against the actual DNS target before it's
+# trusted — otherwise a backend proxied behind a CDN (or any coincidental
+# header/body match) gets misattributed to a provider it isn't even
+# pointing at, producing a takeover finding that isn't actually reachable
+# through that provider.
+SAAS_DNS_PATTERNS = {
+    "heroku":           ("herokudns.com", "herokuapp.com"),
+    "vercel":           ("vercel-dns.com", "vercel.app"),
+    "netlify":          ("netlify.app", "netlify.com"),
+    "shopify":          ("myshopify.com",),
+    "cloudflare_pages": ("pages.dev",),
+}
+
 def is_saas_dns_plausible(saas, dns_target):
     """Return True if the DNS target is consistent with the detected SaaS type."""
     if not saas or not dns_target:
@@ -414,6 +437,13 @@ def is_saas_dns_plausible(saas, dns_target):
 
     # Firebase requires googlehosted.com in the CNAME target
     if saas == "firebase" and "googlehosted.com" not in dns_target:
+        return False
+
+    # Providers detected only via HTTP fingerprint (no DNS-based detection
+    # exists for them in detect_saas_by_domain) must have their CNAME
+    # cross-checked against that provider's known domain patterns.
+    patterns = SAAS_DNS_PATTERNS.get(saas)
+    if patterns and not any(p in dns_target for p in patterns):
         return False
 
     return True
@@ -568,6 +598,23 @@ def _is_non_http_endpoint(_sub_name, _dns_tgt):
     label = (_sub_name or "").lower()
     tgt   = (_dns_tgt or "").lower()
     return any(ind in label or ind in tgt for ind in NON_HTTP_INDICATORS)
+
+def _heroku_router_rejected(status, headers, body):
+    """
+    Heroku's own router (not a backend app) returns 404 with an empty body
+    and 'server: Heroku' when the hostname isn't bound to any app's custom
+    domains. A live app behind Heroku returns its OWN 404 (app-level
+    routing), which carries the app's own 'server' header (or none) and
+    a non-empty body. Empty body + Heroku router headers = router-level
+    rejection = the domain isn't claimed by any app = confirmed dangling.
+    """
+    if status != 404:
+        return False
+    headers_l = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
+    server_is_heroku = "heroku" in headers_l.get("server", "")
+    via_is_heroku_router = "heroku-router" in headers_l.get("via", "")
+    body_empty = not body or not body.strip()
+    return server_is_heroku and via_is_heroku_router and body_empty
 
 def is_critical_subdomain(subdomain):
     """Returns True if the first label of the subdomain is in CRITICAL_NAMES."""
@@ -795,10 +842,32 @@ def risk_score(
             takeover_possible = False
             reasons.append("HTTP 200 - SaaS endpoint active, takeover not possible")
         elif status == 404:
-            score += 30
-            takeover_possible = True
-            reasons.append("SaaS project appears deleted or orphaned")
-            reasons.extend(takeover_reason(saas, dns_target, status, body))
+            if saas == "heroku":
+                heroku_no_such_app = bool(body) and any(
+                    sig in body for sig in HEROKU_NO_SUCH_APP_SIGNATURES
+                )
+                heroku_router_rejected = _heroku_router_rejected(status, headers, body)
+
+                if heroku_no_such_app or heroku_router_rejected:
+                    score += 30
+                    takeover_possible = True
+                    if heroku_router_rejected:
+                        reasons.append(
+                            "Heroku router returned empty-body 404 with no backend app "
+                            "match - hostname not bound to any app (confirmed dangling)"
+                        )
+                    else:
+                        reasons.append("Heroku 'No such app' confirmed - domain unclaimed")
+                else:
+                    reasons.append(
+                        "HTTP 404 from Heroku app - response came from a live backend "
+                        "(not a confirmed takeover)"
+                    )
+            else:
+                score += 30
+                takeover_possible = True
+                reasons.append("SaaS project appears deleted or orphaned")
+                reasons.extend(takeover_reason(saas, dns_target, status, body))
         else:
             if not takeover_possible:
                 takeover_possible = False

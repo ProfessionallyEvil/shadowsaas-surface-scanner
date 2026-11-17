@@ -2014,9 +2014,9 @@ def _maybe_run_trustleak(args, json_output, total_takeovers):
         if args.trustleak or (not args.quiet and sys.stdin.isatty()):
             print(
                 "\n[!] TrustLeak isn't importable from this environment, so "
-                "trust-relationship correlation was skipped. Make sure its "
-                "package directory is importable, or run it directly: "
-                "python run_trustleak.py <output.json>"
+                "trust-relationship correlation was skipped. TrustLeak is a "
+                "separate, optional companion project: "
+                "https://github.com/jbonagura/trustleak"
             )
         return
 
@@ -2028,6 +2028,17 @@ def _maybe_run_trustleak(args, json_output, total_takeovers):
         proceed = answer.strip().lower() == "y"
 
     if not proceed:
+        # The quiet/non-interactive case (where this could NEVER have
+        # worked) is already caught early by _active_probes_flag_is_moot(),
+        # before the scan even starts -- this covers only the genuinely
+        # unpredictable case: an interactive person who just said "no" to
+        # the prompt. There's no way to have known that in advance.
+        if args.allow_active_probes and not args.quiet and sys.stdin.isatty():
+            print(
+                "\n[*] --allow-active-probes has no effect here because "
+                "TrustLeak was declined (pass --trustleak as well to run "
+                "both together without prompting)."
+            )
         return
 
         # Active-probe analyzers (JS today) send a new request beyond what
@@ -2246,6 +2257,23 @@ def _run_domain_scan(_scan_target, speculative, bruteforce, proxies=None, verify
                     _tc += 1
             print(f"[+] {len(_sr)} subdomains total (CT logs/wordlist + asverify-derived)")
     return _sr, _tc
+
+def _active_probes_flag_is_moot(args):
+    """
+    True when --allow-active-probes can never take effect because there's
+    no way to reach TrustLeak at all before the scan even starts: neither
+    --trustleak (which would force it) nor the interactive prompt (which
+    needs a real TTY and non-quiet mode to ever be asked) can happen.
+    Checked once, right after argument parsing, so the person finds out
+    BEFORE sitting through a full scan — not after — that this specific
+    flag combination was never going to do anything.
+    """
+    return (
+        args.allow_active_probes
+        and not args.trustleak
+        and not args.no_trustleak
+        and (args.quiet or not sys.stdin.isatty())
+    )
 
 def main():# pylint: disable=too-many-branches,too-many-statements,too-many-locals
     """Parse CLI arguments, run the scan, and write the requested outputs."""
@@ -2470,6 +2498,15 @@ File format (targets.txt):
 
     args = parser.parse_args()
 
+    if _active_probes_flag_is_moot(args):
+        print(
+            "[*] --allow-active-probes has no effect without --trustleak "
+            "when running quietly or non-interactively (there's no prompt "
+            "to answer in that combination). Pass --trustleak as well if "
+            "you want both together. The scan itself will still run "
+            "normally.\n"
+        )
+
     if not args.domain and not args.file:
         parser.print_help()
         sys.exit(0)
@@ -2600,4 +2637,8 @@ File format (targets.txt):
     _maybe_run_trustleak(args, json_output, total_takeovers)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user (Ctrl+C) — stopping.")
+        sys.exit(130)

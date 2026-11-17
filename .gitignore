@@ -32,3 +32,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# TrustLeak lives in its own separate, published git repository
+# (nested inside this folder) -- never tracked as part of this repo.
+trustleak/

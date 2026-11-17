@@ -234,3 +234,25 @@ This tool is intended for authorized security testing and research only. Use aga
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+## Related Projects
+
+### TrustLeak (optional, separate project)
+
+ShadowSaaS can optionally hand its results off to [**TrustLeak**](https://github.com/jbonagura/trustleak), a companion tool that correlates active applications against the dangling subdomains found here, surfacing trust relationships that extend takeover risk beyond the subdomain itself — shared cookies, CSP references, live-confirmed CORS misconfigurations, OAuth/OIDC discovery documents, and more.
+
+TrustLeak is a separate, standalone project — not bundled with this one. To use it:
+
+```bash
+git clone https://github.com/jbonagura/trustleak.git
+```
+
+Place the cloned `trustleak/` folder as a sibling of this one (or inside it — both layouts are detected automatically), then run:
+
+```bash
+python shadow_saas_surface.py example.com --trustleak
+```
+
+See [TrustLeak's own README](https://github.com/jbonagura/trustleak) for full usage.

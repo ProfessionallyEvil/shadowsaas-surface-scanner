@@ -1,8 +1,7 @@
 """
-ShadowSaaS Surface Scanner v1.0
+ShadowSaaS Surface Scanner
 Author: Jordan Bonagura
 Secure Ideas - Professionally Evil
-
 
 Enumerates subdomains and detects dangling or abandoned SaaS integrations
 by correlating DNS records, HTTP responses, and provider-specific fingerprints.
@@ -11,13 +10,17 @@ Intended for authorized security testing and research only.
 import json
 import re
 import sys
+import tempfile
 import time
-
+import datetime
 import dns.resolver
 import requests
 import tldextract
 import urllib3
+import os
+from urllib.parse import urlparse
 
+__version__ = "1.1.0"
 
 BRUTEFORCE_NAMES = [
     "api", "admin", "login", "auth", "portal",
@@ -41,7 +44,7 @@ GITHUB_PAGES_IPS = {
     "185.199.111.153",
 }
 
-# Azure provider 404 page signatures — confirms the app slot is deleted/unprovisioned.
+# Azure provider 404-page signatures — confirms the app slot is deleted/unprovisioned.
 # A generic 404 from a live app will NOT contain these strings.
 AZURE_404_SIGNATURES = [
     "the web app you have attempted to reach is not available",
@@ -109,6 +112,87 @@ NON_HTTP_INDICATORS = [
     "rdp", "ssh", "sql", "db", "database",
     "vpn", "radius", "sip", "voip",
 ]
+# Headers a future trust-relationship analyzer (TrustLeak) would consume,
+# captured here so it can read them from ShadowSaaS's own http_probe()
+# instead of re-requesting every host from scratch. Keep this list explicit
+# and small — add a header only when something actually reads it.
+TRUSTLEAK_RELEVANT_HEADERS = (
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "set-cookie",
+)
+
+def extract_relevant_headers(headers):
+    """
+    Return a small dict of headers a downstream trust-relationship analyzer
+    would need, keyed by lowercase header name, omitting anything not
+    present. Returns {} (not None) when nothing matched, so callers never
+    have to branch on None vs dict.
+    """
+    if not headers:
+        return {}
+    headers_l = {k.lower(): v for k, v in headers.items()}
+    return {
+        name: headers_l[name]
+        for name in TRUSTLEAK_RELEVANT_HEADERS
+        if name in headers_l
+    }
+
+
+# Simple attribute-value patterns for the HTML elements a downstream
+# trust-relationship analyzer (TrustLeak) would read — iframe/script/form
+# references to another host. Deliberately not a full HTML parser: we only
+# need the raw attribute string, not a validated DOM, and http_probe()
+# already lowercases the whole body, so these patterns are lowercase-only
+# (no re.IGNORECASE needed) and match the same casing fingerprint_saas()
+# already relies on.
+_BODY_REF_PATTERNS = {
+    "iframe_src": re.compile(r"<iframe[^>]+src=[\"']([^\"']+)[\"']"),
+    "script_src": re.compile(r"<script[^>]+src=[\"']([^\"']+)[\"']"),
+    "form_action": re.compile(r"<form[^>]+action=[\"']([^\"']+)[\"']"),
+    # OAuth/SAML references that merely *appear* somewhere in the page
+    # text (a login link's query string, an inline script variable, a
+    # hidden form field) — still passive, since this is the same body
+    # http_probe() already fetched. Deliberately NOT "samlrequest=": that
+    # parameter is a base64-encoded XML blob, not a URL, so it carries no
+    # hostname to correlate. Not anchored to a specific tag, since these
+    # can appear as a query-string parameter on a plain link, inside an
+    # inline <script> block, or as a form field value.
+    "oauth_redirect_uri": re.compile(r"redirect_uri=([^&\s\"'<>]+)"),
+    # Many OAuth JS SDKs (Okta's Sign-In Widget among them) configure
+    # this as a JS object property/assignment in camelCase instead of a
+    # query-string parameter — e.g. `redirectUri: '...'` or
+    # `config.redirectUri = "...";`. Both conventions are common enough
+    # in the wild to warrant their own pattern rather than trying to
+    # force one regex to cover both shapes.
+    "oauth_redirect_uri_js": re.compile(r"redirecturi\s*[:=]\s*[\"']([^\"']+)[\"']"),
+    "saml_acs_url": re.compile(r"assertionconsumerserviceurl=([^&\s\"'<>]+)"),
+}
+
+# Cap per pattern so a page with hundreds of <script> tags (common on
+# heavy ad-tech pages) doesn't bloat the output — downstream correlation
+# only needs a representative sample, not an exhaustive inventory.
+_BODY_REF_CAP_PER_PATTERN = 20
+
+
+def extract_relevant_body_refs(body):
+    """
+    Return a small dict of {pattern_name: [raw attribute values]} found in
+    a page's HTML body — same 'capture once, reuse downstream' philosophy
+    as extract_relevant_headers(), reading the body ShadowSaaS's own
+    http_probe() already fetched rather than requesting anything new.
+    Returns {} (not None) when nothing matched.
+    """
+    if not body:
+        return {}
+    refs = {}
+    for name, pattern in _BODY_REF_PATTERNS.items():
+        matches = pattern.findall(body)[:_BODY_REF_CAP_PER_PATTERN]
+        if matches:
+            refs[name] = matches
+    return refs
 
 # ---------------------------------------------------------------------------
 # Subdomain validation
@@ -139,18 +223,18 @@ def enumerate_by_wordlist(_rd):
     return {f"{name}.{_rd}": "wordlist" for name in CRITICAL_NAMES}
 
 
-def _ct_request(url, _rd, source_label, parse_fn, retries=3, delay=5):
+def _ct_request(url, _rd, source_label, parse_fn, retries=3, delay=5, proxies=None, verify=True):
     """
     Generic CT log fetcher with retry logic.
     parse_fn receives the response and _rd, returns {subdomain: source_label}
     or raises on bad responses.
     """
     subs = {}
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ShadowSaaSSurface/1.0)"}
+    headers = {"User-Agent": f"Mozilla/5.0 (compatible; ShadowSaaSSurface/{__version__})"}
 
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, headers=headers, timeout=30)
+            r = requests.get(url, headers=headers, timeout=30, proxies=proxies, verify=verify)
 
             if r.status_code == 403:
                 raise ValueError(f"HTTP 403 - IP may be blocked by {source_label}")
@@ -163,11 +247,62 @@ def _ct_request(url, _rd, source_label, parse_fn, retries=3, delay=5):
             subs.update(found)
             return subs
 
-        except (
-            requests.exceptions.RequestException,
-            ValueError, KeyError, json.JSONDecodeError,
-        ) as _err:
+
+        except requests.exceptions.SSLError as _err:
+
+            # Must be caught before the generic RequestException below:
+
+            # SSLError is a subclass of it, and a cert verification failure
+
+            # while a proxy is active has one overwhelmingly likely cause —
+
+            # an intercepting proxy (Burp, mitmproxy) whose CA isn't trusted.
+
+            # Retrying won't fix a cert mismatch, so fail this source fast
+
+            # instead of burning 3 attempts with backoff on the same error.
+
+            if proxies and verify:
+                print(
+
+                    f"[!] {source_label} lookup failed with a certificate "
+
+                    f"verification error while --proxy is active: {_err}"
+
+                )
+
+                print(
+
+                    "[!] This almost always means traffic is going through an "
+
+                    "intercepting proxy (e.g. Burp) whose CA requests doesn't "
+
+                    "trust yet. Export the proxy's CA certificate and pass it "
+
+                    "with --proxy-ca <path.pem>, or drop --proxy for this run "
+
+                    "if you don't need to inspect CT log traffic."
+
+                )
+
+                raise ProxyCertificateError(str(_err)) from _err
+
             print(f"[!] {source_label} lookup failed (attempt {attempt}/{retries}): {_err}")
+
+            if attempt < retries:
+                time.sleep(delay * attempt)
+
+
+        except (
+
+                requests.exceptions.RequestException,
+
+                ValueError, KeyError, json.JSONDecodeError,
+
+        ) as _err:
+
+            print(f"[!] {source_label} lookup failed (attempt {attempt}/{retries}): {_err}")
+
             if attempt < retries:
                 time.sleep(delay * attempt)
 
@@ -220,7 +355,7 @@ def _parse_hackertarget(r, _rd):
     return subs
 
 
-def enumerate_ct_logs(_rd, retries=3, delay=5):
+def enumerate_ct_logs(_rd, retries=3, delay=5, proxies=None, verify=True):
     """
     Enumerates subdomains via CT logs using multiple sources in cascade.
     Falls back to the next source if the previous one fails or is blocked.
@@ -242,7 +377,7 @@ def enumerate_ct_logs(_rd, retries=3, delay=5):
 
     for url, label, parse_fn in sources:
         print(f"[*] Querying {label} (CT logs)...")
-        subs = _ct_request(url, _rd, label, parse_fn, retries=retries, delay=delay)
+        subs = _ct_request(url, _rd, label, parse_fn, retries=retries, delay=delay, proxies=proxies, verify=verify)
         if subs:
             print(f"[+] {label} returned {len(subs)} subdomains")
             return subs
@@ -297,12 +432,12 @@ def enumerate_asverify_candidates(analyzed_results, _rd):
     return candidates
 
 
-def enumerate_subdomains(_rd, speculative=False, bruteforce=False):
+def enumerate_subdomains(_rd, speculative=False, bruteforce=False, proxies=None, verify=True):
     """Enumerate subdomains via CT logs, optional wordlist, and optional brute-force."""
     subs = {}
 
     # Primary source — CT logs
-    subs.update(enumerate_ct_logs(_rd))
+    subs.update(enumerate_ct_logs(_rd, proxies=proxies, verify=verify))
 
     # Speculative wordlist (optional)
     if speculative:
@@ -368,12 +503,118 @@ def clean_dns_target(dns_target):
         return None
     return dns_target.replace("CNAME ->", "").replace("A ->", "").strip().strip(".")
 
+# ---------------------------------------------------------------------------
+# Proxy support (v1.1)
+# ---------------------------------------------------------------------------
 
+SUPPORTED_PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://")
+
+class ProxyCertificateError(Exception):
+    """
+    Raised when a CT log request fails with a certificate verification
+    error while a proxy is active. This is a systemic condition (the same
+    untrusted CA affects every HTTPS request through that proxy), not a
+    per-provider issue, so callers should stop the CT log cascade entirely
+    instead of trying the remaining providers.
+    """
+
+def build_proxies(proxy_url):
+    """
+    Build a requests-compatible proxies dict from a single --proxy URL.
+
+    Supports http://, https://, socks5:// and socks5h://.
+    socks5h:// resolves the HTTP target's hostname through the proxy;
+    socks5:// resolves it locally first, then connects through the proxy.
+
+    IMPORTANT: this only affects requests.get() calls (HTTP probes and
+    CT log API lookups). The CNAME/A lookups done via dns.resolver are
+    raw DNS queries, not HTTP requests, and are NOT routed through this
+    proxy. If full-traffic routing matters for the engagement, resolve
+    that at the OS/network level (e.g. proxychains) instead of relying
+    on this flag for the DNS stage.
+
+    Returns None if no proxy was given (default, unchanged v1.0 behaviour).
+    """
+    if not proxy_url:
+        return None
+
+    if not proxy_url.startswith(SUPPORTED_PROXY_SCHEMES):
+        raise ValueError(
+            f"Unsupported proxy scheme: {proxy_url!r}. "
+            f"Use one of: {', '.join(SUPPORTED_PROXY_SCHEMES)}"
+        )
+
+    # Catch a nested scheme (e.g. "socks5h://http://127.0.0.1:8080") before
+    # it gets handed to requests/PySocks, which would silently misparse it
+    # as host="http", no port, and fail later as an opaque connection error.
+    remainder = proxy_url.partition("://")[2]
+    if "://" in remainder:
+        raise ValueError(
+            f"Malformed proxy URL: {proxy_url!r} has a scheme nested inside "
+            f"another scheme. Use exactly one scheme, matching the listener "
+            f"you're pointing at — e.g. 'http://127.0.0.1:8080' for Burp, or "
+            f"'socks5h://127.0.0.1:1080' for an SSH/PuTTY -D dynamic tunnel."
+        )
+
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname or not parsed.port:
+        raise ValueError(
+            f"Malformed proxy URL: {proxy_url!r} must include both host and "
+            f"port, e.g. 'socks5h://127.0.0.1:1080'."
+        )
+
+    if proxy_url.startswith(("socks5://", "socks5h://")):
+        try:
+            import socks  # noqa: F401  (PySocks — requests[socks] / pysocks)
+        except ImportError as exc:
+            raise ImportError(
+                "SOCKS proxy requested but PySocks is not installed. "
+                "Run: pip install requests[socks]"
+            ) from exc
+
+    if proxy_url.startswith("socks5://"):
+        print(
+            "[!] socks5:// routes HTTP probes and CT log lookups through the "
+            "proxy, but CNAME/A resolution (dns.resolver) still happens "
+            "locally, outside the tunnel."
+        )
+
+    return {"http": proxy_url, "https": proxy_url}
+
+def resolve_ca_bundle(proxy_ca_path):
+    """
+    Resolve the --proxy-ca argument into the 'verify' value requests expects.
+
+    Only affects the CT log lookups (_ct_request), which use verify=True by
+    default. http_probe() already uses verify=False on purpose, because
+    dangling/expired certs on abandoned subdomains are expected, not a
+    MITM signal to validate against.
+
+    When inspecting CT log traffic through an intercepting proxy (Burp,
+    mitmproxy, etc.), requests has no way to know that proxy's CA, so
+    verify=True fails with CERTIFICATE_VERIFY_FAILED even though the
+    connection itself is fine. Pass the proxy's exported CA (PEM) here
+    instead of disabling verification globally.
+
+    Returns True (default requests behaviour) if no path was given.
+    """
+    if not proxy_ca_path:
+        return True
+
+    if not os.path.isfile(proxy_ca_path):
+        raise ValueError(
+            f"--proxy-ca path not found: {proxy_ca_path!r}. "
+            f"Export your proxy's CA certificate (e.g. in Burp: Settings > "
+            f"Network > TLS > Import / export CA certificate) and convert it "
+            f"to PEM if needed: openssl x509 -inform DER -in cert.der -out cert.pem"
+        )
+
+    return proxy_ca_path
 # ---------------------------------------------------------------------------
 # HTTP probe
 # ---------------------------------------------------------------------------
 
-def http_probe(subdomain):
+def http_probe(subdomain, proxies=None):
     """Probe subdomain over HTTPS then HTTP; return (status, headers, body)."""
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -382,13 +623,28 @@ def http_probe(subdomain):
             r = requests.get(
                 f"{scheme}://{subdomain}",
                 timeout=5,
-                headers={"User-Agent": "ShadowSaaSSurface/1.0"},
-                verify=False  # allow dangling/expired certs
+                headers={"User-Agent": f"ShadowSaaSSurface/{__version__}"},
+                verify=False,  # allow dangling/expired certs
+                proxies=proxies
             )
             return r.status_code, r.headers, r.text.lower()
         except requests.exceptions.SSLError:
             continue
         except requests.exceptions.Timeout:
+            continue
+        except requests.exceptions.ProxyError as exc:
+            # Must be caught before ConnectionError: ProxyError is a subclass
+            # of it, and a silently-swallowed proxy failure here looks
+            # identical to a genuinely offline subdomain — the exact false
+            # negative that cost a confirmed takeover during testing.
+            print(
+                f"[!] Proxy error probing {scheme}://{subdomain} — {exc}"
+            )
+            print(
+                "[!] Check that the proxy is reachable and that --proxy's "
+                "scheme matches the listener (http:// for Burp-style proxies, "
+                "socks5:// / socks5h:// for an SSH/PuTTY -D dynamic tunnel)."
+            )
             continue
         except requests.exceptions.ConnectionError:
             continue
@@ -981,7 +1237,7 @@ def calculate_confidence(_source, dns_active, saas, takeover_possible):
     return "low"
 
 
-def analyze_subdomain(subdomain, _source, _rd):
+def analyze_subdomain(subdomain, _source, _rd, proxies=None):
     """Run full DNS, HTTP, SaaS detection and risk scoring for one subdomain."""
 
     # Resolve DNS
@@ -990,7 +1246,7 @@ def analyze_subdomain(subdomain, _source, _rd):
 
     # HTTP probe (only if DNS resolves)
     if dns_active:
-        status, headers, body = http_probe(subdomain)
+        status, headers, body = http_probe(subdomain, proxies=proxies)
     else:
         status, headers, body = None, {}, ""
 
@@ -1018,6 +1274,8 @@ def analyze_subdomain(subdomain, _source, _rd):
 
     # Confidence
     confidence = calculate_confidence(_source, dns_active, saas, takeover_possible)
+    relevant_headers = extract_relevant_headers(headers)
+    relevant_body_refs = extract_relevant_body_refs(body)
 
     return {
         "subdomain": subdomain,
@@ -1029,7 +1287,9 @@ def analyze_subdomain(subdomain, _source, _rd):
         "risk_score": score,
         "takeover_possible": takeover_possible,
         "confidence": confidence,
-        "analysis": reasons
+        "analysis": reasons,
+        "relevant_headers": relevant_headers,
+        "relevant_body_refs": relevant_body_refs,
     }
 
 
@@ -1490,7 +1750,7 @@ def _render_html_report(_report_data):
     <div class="logo">&#9632; Secure Ideas · Professionally Evil</div>
     <h1>Shadow<span class="red">SaaS</span> Surface Scanner</h1>
     <div class="subtitle">
-      Subdomain Takeover &amp; Dangling CNAME Report &nbsp;·&nbsp; v1.0
+      Subdomain Takeover &amp; Dangling CNAME Report &nbsp;·&nbsp;  v{__version__}
       &nbsp;·&nbsp;
       <a href="https://www.linkedin.com/in/jordan-bonagura" target="_blank" rel="noopener noreferrer">Jordan Bonagura</a>
       &nbsp;·&nbsp;
@@ -1544,7 +1804,7 @@ def _render_html_report(_report_data):
 </div>
 
 <div class="footer">
-  Generated by ShadowSaaS Surface Scanner v1.0 &nbsp;&middot;&nbsp;
+  Generated by ShadowSaaS Surface Scanner  v{__version__} &nbsp;&middot;&nbsp;
   <a href="https://www.linkedin.com/in/jordan-bonagura" target="_blank" rel="noopener noreferrer">Jordan Bonagura</a>
   &nbsp;&middot;&nbsp;
   <a href="https://www.secureideas.com" target="_blank" rel="noopener noreferrer">Secure Ideas - Professionally Evil</a>
@@ -1593,6 +1853,280 @@ def _render_html_report(_report_data):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _summarize_findings(findings):
+    """
+    One short line breaking findings down by potential_impact — same
+    helper as run_trustleak.py's, duplicated here since
+    shadow_saas_surface.py's TrustLeak integration prints its own
+    summary rather than calling into run_trustleak.py's main().
+    """
+    if not findings:
+        return None
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for f in findings:
+        impact = f.get("assessment", {}).get("potential_impact", "low")
+        counts[impact] = counts.get(impact, 0) + 1
+    parts = [f"{counts[level]} {level} impact" for level in ("high", "medium", "low") if counts[level]]
+    return ", ".join(parts)
+
+
+def _default_evidence_base(source_name):
+    """
+    (base_dir, slug) shared by every auto-named evidence path below.
+    Placed next to the scan output file itself (args.output's own
+    directory), not wherever the current working directory happens to be
+    — otherwise the same scan produces evidence in a different physical
+    location depending on which folder you were standing in when you ran
+    shadow_saas_surface.py vs. run_trustleak.py directly, which is
+    confusing when managing an engagement's evidence across both entry
+    points. Falls back to the current directory only when there's no
+    output file to anchor to (args.output was never given — ShadowSaaS
+    printed JSON to stdout instead).
+    """
+    if source_name:
+        base_dir = os.path.dirname(os.path.abspath(source_name))
+        slug = os.path.splitext(os.path.basename(source_name))[0]
+    else:
+        base_dir = os.getcwd()
+        slug = "scan"
+    return base_dir, slug
+
+
+def _default_trustleak_html_path(source_name):
+    """
+    Auto-generated default HTML report path, used whenever
+    --trustleak-html wasn't given — so a raw wall of JSON is never the
+    only output a person gets out of continuing into TrustLeak.
+    """
+    base_dir, slug = _default_evidence_base(source_name)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(base_dir, f"trustleak_report_{slug}_{timestamp}.html")
+
+
+def _default_js_output_dir(source_name):
+    """
+    Auto-generated default for where the JS active analyzer saves fetched
+    files — nobody has to type a directory name just to get the evidence
+    saved, and a later run doesn't silently overwrite an earlier one's.
+    """
+    base_dir, slug = _default_evidence_base(source_name)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(base_dir, f"trustleak_js_{slug}_{timestamp}")
+
+
+def _default_oidc_output_dir(source_name):
+    """Same philosophy as _default_js_output_dir(), for OAuth/OIDC discovery evidence."""
+    base_dir, slug = _default_evidence_base(source_name)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(base_dir, f"trustleak_oidc_{slug}_{timestamp}")
+
+def _default_cors_output_dir(source_name):
+    """Same philosophy as _default_js_output_dir(), for CORS reflection evidence."""
+    base_dir, slug = _default_evidence_base(source_name)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(base_dir, f"trustleak_cors_{slug}_{timestamp}")
+
+def _locate_trustleak():
+    """
+    Try to import TrustLeak's public entry points (correlate, importer,
+    report). TrustLeak is a separate, optional project — ShadowSaaS works
+    exactly as before if it isn't installed or importable. Tries a plain
+    import first (works if it's pip-installed, or already on PYTHONPATH),
+    then a couple of common sibling-folder layouts before giving up,
+    since the two projects are typically developed side by side rather
+    than packaged.
+
+    Deliberately NOT called at module import time — only from inside
+    main(), so a missing TrustLeak install never affects anything else
+    ShadowSaaS does.
+    """
+    result = _try_import_trustleak()
+    if result:
+        return result
+
+    # Each candidate below is a directory to try adding to sys.path; it
+    # only qualifies if it has a "trustleak" subdirectory directly under
+    # it. That subdirectory can be the package itself (e.g. a sibling
+    # "trustleak/" folder whose .py files sit right inside it) or one
+    # level further in (e.g. "trustleak_prep/trustleak/") — both layouts
+    # are common depending on how the two projects were cloned/unzipped.
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate_parents = (
+        here,                                   # ./trustleak/
+        os.path.dirname(here),                  # ../trustleak/ (sibling of this script's own folder)
+        os.path.join(here, "trustleak_prep"),   # ./trustleak_prep/trustleak/
+    )
+    for parent in candidate_parents:
+        package_dir = os.path.join(parent, "trustleak")
+        if os.path.isdir(package_dir):
+            sys.path.insert(0, os.path.abspath(parent))
+            result = _try_import_trustleak()
+            if result:
+                return result
+            sys.path.pop(0)
+
+    return None
+
+def _try_import_trustleak():
+    """
+    Attempt 'from trustleak import correlate, importer, report' and
+    return the three modules as a tuple, or None on ImportError.
+
+    Isolated in its own function so correlate/importer/report are only
+    ever referenced inside the try block that defines them (the return
+    happens right there) — nothing after the try/except reads those
+    names, so there's nothing to assign a fallback value for and nothing
+    left unused either.
+    """
+    try:
+        from trustleak import correlate, importer, report
+        return correlate, importer, report
+    except ImportError:
+        return None
+
+def _maybe_run_trustleak(args, json_output, total_takeovers):
+    """
+    If TrustLeak is available and the person wants to continue into it
+    (forced with --trustleak, or answered yes to the interactive prompt),
+    correlate this scan's findings and print/save its results. A no-op
+    in every other case — including when stdin isn't a TTY, so this
+    never hangs an automated/CI run waiting for input.
+
+    When total_takeovers is 0, there is nothing for TrustLeak to
+    correlate against regardless of what else this scan found — skip the
+    prompt (and the --trustleak auto-continue) entirely rather than ask
+    a question whose answer can't matter.
+    """
+    if args.no_trustleak:
+        return
+
+    if total_takeovers == 0:
+        if args.trustleak or (not args.quiet and sys.stdin.isatty()):
+            print(
+                "\n[*] No potential takeovers found in this scan, so "
+                "there's nothing for TrustLeak to correlate trust "
+                "relationships against — skipping."
+            )
+        return
+
+    trustleak_entrypoints = _locate_trustleak()
+    if not trustleak_entrypoints:
+        if args.trustleak or (not args.quiet and sys.stdin.isatty()):
+            print(
+                "\n[!] TrustLeak isn't importable from this environment, so "
+                "trust-relationship correlation was skipped. Make sure its "
+                "package directory is importable, or run it directly: "
+                "python run_trustleak.py <output.json>"
+            )
+        return
+
+    tl_correlate, tl_importer, tl_report = trustleak_entrypoints
+
+    proceed = args.trustleak
+    if not proceed and not args.quiet and sys.stdin.isatty():
+        answer = input("\n[?] Continue to TrustLeak trust-relationship analysis? [y/N] ")
+        proceed = answer.strip().lower() == "y"
+
+    if not proceed:
+        return
+
+        # Active-probe analyzers (JS today) send a new request beyond what
+        # ShadowSaaS collected — a separate, explicit decision from "continue
+        # to TrustLeak at all". --allow-active-probes forces it without
+        # asking; otherwise ask only when there's a person there to answer,
+        # same TTY/quiet guard as the prompt above. Non-interactive runs
+        # without the flag default to passive-only, never active by
+        # assumption.
+    allow_active = args.allow_active_probes
+    if not allow_active and not args.quiet and sys.stdin.isatty():
+        answer = input(
+            "[?] Allow active-probe analyzers (e.g. downloading a "
+            "referenced .js file)? This sends new requests beyond what "
+            "ShadowSaaS collected. [y/N] "
+        )
+        allow_active = answer.strip().lower() == "y"
+
+    tl_active_kwargs = None
+    if allow_active:
+        js_output_dir = args.js_output_dir or _default_js_output_dir(args.output)
+        print(f"[*] JS evidence will be saved to {js_output_dir}")
+        oidc_output_dir = args.oidc_output_dir or _default_oidc_output_dir(args.output)
+        print(f"[*] OIDC evidence will be saved to {oidc_output_dir}")
+        cors_output_dir = args.cors_output_dir or _default_cors_output_dir(args.output)
+        print(f"[*] CORS reflection evidence will be saved to {cors_output_dir}")
+        tl_active_kwargs = {
+            "js_content": {"output_dir": js_output_dir},
+            "oauth_discovery": {"output_dir": oidc_output_dir},
+            "cors_reflection": {"output_dir": cors_output_dir},
+        }
+
+    tl_input_path = args.output
+    tl_temp_path = None
+    if not tl_input_path:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as tl_temp_file:
+            tl_temp_file.write(json_output)
+            tl_temp_path = tl_temp_file.name
+        tl_input_path = tl_temp_path
+
+    try:
+        tl_result = tl_importer.import_shadowsaas_output(tl_input_path)
+        tl_findings = tl_correlate.correlate_all(
+            tl_result, allow_active=allow_active, active_analyzer_kwargs=tl_active_kwargs,
+        )
+        tl_impact_summary = _summarize_findings(tl_findings)
+        tl_explanation = tl_correlate.explain_empty(tl_result, tl_findings)
+
+        tl_html_path = None
+        if tl_findings:
+            tl_html_path = args.trustleak_html or _default_trustleak_html_path(args.output)
+        elif args.trustleak_html:
+            tl_html_path = args.trustleak_html
+        if tl_html_path:
+            tl_html = tl_report.render_html_report(tl_result, tl_findings)
+            with open(tl_html_path, "w", encoding="utf-8") as fh:
+                fh.write(tl_html)
+
+        # The raw JSON dump below can be hundreds of lines long — long
+        # enough on a real scan to push anything printed before it off
+        # the top of a terminal's visible scrollback. It's printed here,
+        # BEFORE the human-readable summary, so that summary — the part
+        # actually worth reading without scrolling back up — is the last
+        # thing on screen once the command finishes.
+        print(json.dumps(
+            {"findings": tl_findings}, indent=2 if args.pretty else None
+        ))
+
+        print(f"\n[+] TrustLeak: {len(tl_findings)} trust-relationship finding(s)")
+        if tl_impact_summary:
+            print(f"    {tl_impact_summary}")
+        if tl_explanation:
+            print(f"[*] {tl_explanation}")
+        if tl_result.skipped:
+            print(
+                f"[!] TrustLeak skipped {len(tl_result.skipped)} record(s) "
+                f"that failed its schema validation"
+            )
+        if tl_html_path:
+            print(f"[+] TrustLeak HTML report saved to {tl_html_path}")
+        if tl_active_kwargs:
+            if "js_content" in tl_active_kwargs:
+                print(f"[+] JS evidence saved to {tl_active_kwargs['js_content']['output_dir']}")
+            if "oauth_discovery" in tl_active_kwargs:
+                print(f"[+] OIDC evidence saved to {tl_active_kwargs['oauth_discovery']['output_dir']}")
+            if "cors_reflection" in tl_active_kwargs:
+                print(f"[+] CORS reflection evidence saved to {tl_active_kwargs['cors_reflection']['output_dir']}")
+        if tl_findings:
+            print(
+                "[*] Tip: --state FILE keeps finding_ids stable across "
+                "repeated scans of the same target."
+            )
+    except ValueError as exc:
+        print(f"[!] TrustLeak could not process the scan output: {exc}")
+    finally:
+        if tl_temp_path:
+            os.unlink(tl_temp_path)
 
 def _normalize_target(_raw):
     """Strip scheme prefix and whitespace from a domain/subdomain string."""
@@ -1604,7 +2138,7 @@ def _normalize_target(_raw):
     return t.rstrip("/")
 
 
-def _run_domain_scan(_scan_target, speculative, bruteforce):
+def _run_domain_scan(_scan_target, speculative, bruteforce, proxies=None, verify=True, warnings=None):
     """
     Run a full scan for a single root domain or direct subdomain.
     Returns (scan_results, scan_takeovers).
@@ -1625,7 +2159,7 @@ def _run_domain_scan(_scan_target, speculative, bruteforce):
             print(f"[+] Fallback root domain: {_root}")
 
         print(f"[+] Direct subdomain analysis: {_scan_target}")
-        _res = analyze_subdomain(_scan_target, "direct_input", _root)
+        _res = analyze_subdomain(_scan_target, "direct_input", _root, proxies=proxies)
         _sr.append(_res)
 
         if _res["takeover_possible"]:
@@ -1639,11 +2173,29 @@ def _run_domain_scan(_scan_target, speculative, bruteforce):
         _domain = ext.top_domain_under_public_suffix or _scan_target
         print(f"[+] Enumerating subdomains for {_domain}...")
 
-        subdomains = enumerate_subdomains(
-            _domain,
-            speculative=speculative,
-            bruteforce=bruteforce,
-        )
+        try:
+            subdomains = enumerate_subdomains(
+                _domain,
+                speculative=speculative,
+                bruteforce=bruteforce,
+                proxies=proxies,
+                verify=verify,
+            )
+        except ProxyCertificateError:
+            print(
+                f"[!] Aborting the scan of {_domain} entirely — a proxy "
+                f"certificate error means CT log enumeration can't be "
+                f"trusted, and falling back to --speculative/--bruteforce "
+                f"would only produce a partial result mislabelled as a "
+                f"full scan. Fix --proxy-ca (or drop --proxy) and re-run."
+            )
+            if warnings is not None:
+                warnings.append(
+                    f"Scan of {_domain} was aborted entirely due to a proxy "
+                    f"certificate error. No enumeration method (CT logs, "
+                    f"speculative, or brute-force) was run for this target."
+                )
+            return _sr, _tc
 
         if not subdomains:
             print("[!] No subdomains found via CT logs.")
@@ -1653,14 +2205,14 @@ def _run_domain_scan(_scan_target, speculative, bruteforce):
             else:
                 print("[!] Tip: try --speculative")
 
-        print(f"[+] Found {len(subdomains)} subdomains\n")
+        print(f"[+] Found {len(subdomains)} subdomains from CT logs/wordlist\n")
 
         # ---- First pass: analyse all discovered subdomains ----
         first_pass_results = []
         total = len(subdomains)
         for i, (_sub, _source) in enumerate(subdomains.items(), start=1):
             print(f"[+] [{i}/{total}] Analyzing {_sub}")
-            _res = analyze_subdomain(_sub, _source, _domain)
+            _res = analyze_subdomain(_sub, _source, _domain, proxies=proxies)
 
             if _res["dns_target"] and _domain in _res["dns_target"].lower():
                 _res["takeover_possible"] = False
@@ -1681,7 +2233,7 @@ def _run_domain_scan(_scan_target, speculative, bruteforce):
             av_total = len(asverify_candidates)
             for i, (_sub, _source) in enumerate(asverify_candidates.items(), start=1):
                 print(f"[+] [asverify {i}/{av_total}] Analyzing {_sub}")
-                _res = analyze_subdomain(_sub, _source, _domain)
+                _res = analyze_subdomain(_sub, _source, _domain, proxies=proxies)
 
                 if _res["dns_target"] and _domain in _res["dns_target"].lower():
                     _res["takeover_possible"] = False
@@ -1692,11 +2244,11 @@ def _run_domain_scan(_scan_target, speculative, bruteforce):
                 _sr.append(_res)
                 if _res["takeover_possible"]:
                     _tc += 1
-
+            print(f"[+] {len(_sr)} subdomains total (CT logs/wordlist + asverify-derived)")
     return _sr, _tc
 
-
-if __name__ == "__main__":
+def main():# pylint: disable=too-many-branches,too-many-statements,too-many-locals
+    """Parse CLI arguments, run the scan, and write the requested outputs."""
     import argparse
 
     # ------------------------------------------------------------------
@@ -1705,9 +2257,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="shadow_saas_surface.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="""
+        description=f"""
 ┌─────────────────────────────────────────────────────────────────┐
-│               ShadowSaaS Surface Scanner  v1.0                  │
+│               ShadowSaaS Surface Scanner  v{__version__}                │
 │        Subdomain Takeover & Dangling CNAME Detector             │
 │                      Jordan Bonagura                            │
 │               Secure Ideas - Professionally Evil                │
@@ -1833,11 +2385,101 @@ File format (targets.txt):
         help="Only include results where takeover_possible is true in the output."
     )
 
+    parser.add_argument(
+        "--proxy",
+        metavar="URL",
+        help=(
+            "Route HTTP probes and CT log lookups through a proxy. "
+            "Accepts http://, https://, socks5:// or socks5h:// "
+            "(e.g. http://127.0.0.1:8080 or socks5h://127.0.0.1:9050). "
+            "DNS CNAME/A resolution is not routed through this proxy."
+        ),
+    )
+    parser.add_argument(
+        "--proxy-ca",
+        metavar="PATH",
+        help=(
+            "Path to a CA bundle (PEM) to trust for CT log HTTPS lookups "
+            "when inspecting traffic through an intercepting proxy like Burp. "
+            "Only affects crt.sh/certspotter/hackertarget requests — "
+            "http_probe() already uses verify=False for the subdomains "
+            "themselves, since dangling/expired certs there are expected."
+        ),
+    )
+    parser.add_argument(
+        "--trustleak",
+        action="store_true",
+        help=(
+            "After scanning, automatically continue into TrustLeak (if "
+            "importable) to correlate active applications against any "
+            "takeover candidates found, without the interactive prompt. "
+            "Ignored if --no-trustleak is also given."
+        ),
+    )
+    parser.add_argument(
+        "--no-trustleak",
+        action="store_true",
+        help="Skip the TrustLeak prompt/continuation entirely, even if TrustLeak is available.",
+    )
+    parser.add_argument(
+        "--trustleak-html",
+        metavar="FILE",
+        help="If continuing into TrustLeak, also write its HTML report to FILE.",
+    )
+    parser.add_argument(
+        "--allow-active-probes",
+        action="store_true",
+        help=(
+            "Allow TrustLeak's active-probe analyzers to send new requests "
+            "(e.g. downloading a referenced .js file) beyond what this scan "
+            "collected. Forces the decision without the extra interactive "
+            "prompt that would otherwise appear after continuing into "
+            "TrustLeak."
+        ),
+    )
+    parser.add_argument(
+        "--js-output-dir",
+        metavar="DIR",
+        help=(
+            "If active probes are allowed, save every .js file TrustLeak's "
+            "JS analyzer fetches into DIR (plus a manifest.json). Has no "
+            "effect without active probes being allowed."
+        ),
+    )
+    parser.add_argument(
+        "--oidc-output-dir",
+        metavar="DIR",
+        help=(
+            "If active probes are allowed, save every valid OIDC discovery "
+            "document TrustLeak's OAuth analyzer finds into DIR (plus a "
+            "manifest.json). Has no effect without active probes being "
+            "allowed."
+        ),
+    )
+
+    parser.add_argument(
+        "--cors-output-dir",
+        metavar="DIR",
+        help=(
+            "If active probes are allowed, save evidence for every "
+            "CONFIRMED CORS origin reflection TrustLeak's CORS analyzer "
+            "finds into DIR (plus a manifest.json). Has no effect without "
+            "active probes being allowed."
+        ),
+    )
+
     args = parser.parse_args()
 
     if not args.domain and not args.file:
         parser.print_help()
         sys.exit(0)
+
+    try:
+        proxies = build_proxies(args.proxy)
+        verify = resolve_ca_bundle(args.proxy_ca)
+    except (ValueError, ImportError) as exc:
+        print(f"[!] {exc}")
+        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Build target list
@@ -1884,6 +2526,7 @@ File format (targets.txt):
     # ------------------------------------------------------------------
     all_results = []
     total_takeovers = 0
+    scan_warnings = []
 
     for idx, _scan_target in enumerate(targets, start=1):
         if len(targets) > 1:
@@ -1895,6 +2538,9 @@ File format (targets.txt):
             _scan_target,
             speculative=args.speculative,
             bruteforce=args.bruteforce,
+            proxies=proxies,
+            verify=verify,
+            warnings=scan_warnings,
         )
         all_results.extend(scan_results)
         total_takeovers += scan_takeovers
@@ -1908,15 +2554,25 @@ File format (targets.txt):
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
+    summary: dict = {
+        "total_subdomains": len(all_results),
+        "potential_takeovers": total_takeovers,
+        "targets_scanned": len(targets),
+    }
+    if scan_warnings:
+        summary["warnings"] = scan_warnings
+        print("\n" + "=" * 60)
+        print("[!] WARNING: this scan did not complete cleanly.")
+        for w in scan_warnings:
+            print(f"    - {w}")
+        print("    The counts above are NOT a confirmed result — fix the")
+        print("    issue above and re-run before trusting a '0 found' outcome.")
+        print("=" * 60)
+
     output_data = {
-        "summary": {
-            "total_subdomains": len(all_results),
-            "potential_takeovers": total_takeovers,
-            "targets_scanned": len(targets),
-        },
+        "summary": summary,
         "results": all_results,
     }
-
     json_output = json.dumps(
         output_data,
         indent=2 if args.pretty else None
@@ -1940,3 +2596,8 @@ File format (targets.txt):
         with open(args.html, "w", encoding="utf-8") as fh:
             fh.write(html)
         print(f"[+] HTML report saved to {args.html}")
+
+    _maybe_run_trustleak(args, json_output, total_takeovers)
+
+if __name__ == "__main__":
+    main()

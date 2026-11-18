@@ -20,7 +20,7 @@ import urllib3
 import os
 from urllib.parse import urlparse
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 BRUTEFORCE_NAMES = [
     "api", "admin", "login", "auth", "portal",
@@ -2480,7 +2480,12 @@ File format (targets.txt):
             "--html, --trustleak-html, --trustleak-output you didn't "
             "specify yourself -- the one-flag way to get a full scan, "
             "TrustLeak correlation, both HTML reports, and a reusable "
-            "findings file, without typing out every path by hand."
+            "findings file, without typing out every path by hand. Still "
+            "respects each active analyzer's own per-analyzer confirmation "
+            "prompt past its request-volume threshold (JS, OIDC, CORS) -- "
+            "only skips the two higher-level decisions (continue into "
+            "TrustLeak at all, allow active probes at all), not those "
+            "volume safeguards."
         ),
     )
     parser.add_argument(

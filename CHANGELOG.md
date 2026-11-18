@@ -4,6 +4,28 @@ All notable changes to ShadowSaaS Surface Scanner are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-18
+
+### Added
+- `--trustleak-output FILE` — when continuing into TrustLeak, save its
+  findings (plus the summary info needed to regenerate a report later)
+  to FILE as JSON. Previously TrustLeak's findings were only ever
+  printed to stdout, interleaved with scan progress, with no way to
+  persist them cleanly for reuse.
+- `--all` — shorthand for `--trustleak --allow-active-probes`, plus an
+  auto-generated filename (domain + timestamp) for any of `-o`,
+  `--html`, `--trustleak-html`, `--trustleak-output` not specified
+  explicitly. Still respects each active analyzer's own per-analyzer
+  confirmation prompt past its request-volume threshold (JS, OIDC,
+  CORS) — only skips the two higher-level decisions (continue into
+  TrustLeak at all, allow active probes at all), not those volume
+  safeguards. Explicit paths the person already gave are never
+  overridden.
+
+### Compatibility
+- Fully backward compatible. Neither new flag changes behaviour unless
+  passed explicitly.
+
 ## [1.1.0] - 2026-10-31
 
 ### Added

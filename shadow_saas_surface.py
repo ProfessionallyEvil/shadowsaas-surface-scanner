@@ -2099,6 +2099,11 @@ def _maybe_run_trustleak(args, json_output, total_takeovers):
             with open(tl_html_path, "w", encoding="utf-8") as fh:
                 fh.write(tl_html)
 
+        if args.trustleak_output:
+            tl_saved_payload = {"findings": tl_findings, "summary": tl_result.summary()}
+            with open(args.trustleak_output, "w", encoding="utf-8") as fh:
+                json.dump(tl_saved_payload, fh, indent=2 if args.pretty else None)
+
         # The raw JSON dump below can be hundreds of lines long — long
         # enough on a real scan to push anything printed before it off
         # the top of a terminal's visible scrollback. It's printed here,
@@ -2121,6 +2126,9 @@ def _maybe_run_trustleak(args, json_output, total_takeovers):
             )
         if tl_html_path:
             print(f"[+] TrustLeak HTML report saved to {tl_html_path}")
+        if args.trustleak_output:
+            print(
+                f"[+] TrustLeak findings saved to {args.trustleak_output} (reusable later with run_trustleak.py --render-from)")
         if tl_active_kwargs:
             if "js_content" in tl_active_kwargs:
                 print(f"[+] JS evidence saved to {tl_active_kwargs['js_content']['output_dir']}")
@@ -2455,6 +2463,27 @@ File format (targets.txt):
         help="If continuing into TrustLeak, also write its HTML report to FILE.",
     )
     parser.add_argument(
+        "--trustleak-output",
+        metavar="FILE",
+        help=(
+            "If continuing into TrustLeak, also save its findings (+ enough "
+            "summary info to --render-from later with run_trustleak.py) to "
+            "FILE as JSON."
+        ),
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Shorthand for --trustleak --allow-active-probes, plus an "
+            "auto-generated filename (domain + timestamp) for any of -o, "
+            "--html, --trustleak-html, --trustleak-output you didn't "
+            "specify yourself -- the one-flag way to get a full scan, "
+            "TrustLeak correlation, both HTML reports, and a reusable "
+            "findings file, without typing out every path by hand."
+        ),
+    )
+    parser.add_argument(
         "--allow-active-probes",
         action="store_true",
         help=(
@@ -2497,6 +2526,25 @@ File format (targets.txt):
     )
 
     args = parser.parse_args()
+
+    if args.all:
+        args.trustleak = True
+        args.allow_active_probes = True
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        domain_slug = re.sub(r"[^a-zA-Z0-9]+", "_", args.domain).strip("_") if args.domain else "scan"
+        base = f"{domain_slug}_{timestamp}"
+        if not args.output:
+            args.output = f"shadowsaas_{base}.json"
+        if not args.html:
+            args.html = f"shadowsaas_{base}.html"
+        if not args.trustleak_html:
+            args.trustleak_html = f"trustleak_report_{base}.html"
+        if not args.trustleak_output:
+            args.trustleak_output = f"trustleak_findings_{base}.json"
+        print(
+            "[*] --all: forcing --trustleak and --allow-active-probes; "
+            "auto-naming any output file you didn't specify yourself.\n"
+        )
 
     if _active_probes_flag_is_moot(args):
         print(
